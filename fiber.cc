@@ -15,7 +15,11 @@
 using namespace std;
 using namespace fmt;
 
-using stack_ptr = std::unique_ptr<char[]>;
+struct stack_release {
+  void operator()(char *ptr) const noexcept { free(ptr); }
+};
+
+using stack_ptr = std::unique_ptr<char[], stack_release>;
 
 struct jmp_buf_link {
   jmp_buf jmpbuf;
