@@ -107,38 +107,56 @@ stack_ptr make_stack(size_t stack_size) {
   return stack;
 }
 
-void t_main() {
+// There is no caller of main() in this context. We need to annotate this frame like this so that
+// unwinders don't try to trace back past this frame.
+// See https://github.com/scylladb/scylla/issues/1909.
 #ifdef __x86_64__
-    // There is no caller of main() in this context. We need to annotate this frame like this so that
-    // unwinders don't try to trace back past this frame.
-    // See https://github.com/scylladb/scylla/issues/1909.
-    asm(".cfi_undefined rip");
+#define MAKE_FRAME() asm(".cfi_undefined rip");
 #elif defined(__PPC__)
-    asm(".cfi_undefined lr");
+#define MAKE_FRAME() asm(".cfi_undefined lr");
 #elif defined(__aarch64__)
-    asm(".cfi_undefined x30");
+#define MAKE_FRAME() asm(".cfi_undefined x30");
 #elif defined(__s390x__)
-    asm(".cfi_undefined %r14");
+#define MAKE_FRAME() asm(".cfi_undefined %r14");
 #else
-    #warning "Backtracing from seastar threads may be broken"
+#define MAKE_FRAME() #warning "Backtracing threads may be broken"
 #endif
-    try {
-        cout << "hi" << endl;
-    } catch (...) {
-    }
+
+void async_ping(jmp_buf_link *link) {
+  MAKE_FRAME();
+  while (true) {
+    cout << "ping" << endl;
+    link->leave();
+  }
 }
 
-void s_main(void) {
-  t_main();
+void async_pong(jmp_buf_link *link) {
+  MAKE_FRAME();
+  while (true) {
+    cout << "pong" << endl;
+    link->leave();
+  }
 }
 
-void setup(jmp_buf_link *ctx, void *stack, size_t stack_size) {
+// all parameters MUST be <int> for makecontext
+void async_ping_main(int lo, int hi) {
+  uintptr_t q = uint64_t(uint32_t(lo)) | uint64_t(hi) << 32;
+  async_ping(reinterpret_cast<jmp_buf_link *>(q));
+}
+
+// all parameters MUST be <int> for makecontext
+void async_pong_main(int lo, int hi) {
+  uintptr_t q = uint64_t(uint32_t(lo)) | uint64_t(hi) << 32;
+  async_pong(reinterpret_cast<jmp_buf_link *>(q));
+}
+
+void setup(jmp_buf_link *ctx, void *stack, size_t stack_size, void (*f)()) {
   // use setcontext() for the initial jump, as it allows us
   // to set up a stack, but continue with longjmp() as it's
   // much faster.
   ucontext_t initial_context;
 
-  auto main = reinterpret_cast<void (*)()>(&s_main);
+  auto q = uint64_t(reinterpret_cast<uintptr_t>(ctx));
   auto r = getcontext(&initial_context);
   throw_system_error_on(r == -1, "getcontext");
 
@@ -146,18 +164,31 @@ void setup(jmp_buf_link *ctx, void *stack, size_t stack_size) {
   initial_context.uc_stack.ss_size = stack_size;
   initial_context.uc_link = nullptr;
 
-  makecontext(&initial_context, main, 0);
+  makecontext(&initial_context, f, 2, int(q), int(q >> 32));
 
   ctx->begin(&initial_context, stack, stack_size);
 }
 
 int main() {
   const size_t stack_size = 4 * 4096;
-  stack_ptr stack = make_stack(stack_size);
-  jmp_buf_link jmp;
+  const size_t n = 2;
+  stack_ptr stack[n];
+  jmp_buf_link jmp[n];
+  void (*fns[])() = {
+    reinterpret_cast<void (*)()>(&async_ping_main),
+    reinterpret_cast<void (*)()>(&async_pong_main)
+  };
 
   init();
-  setup(&jmp, stack.get(), stack_size);
+
+  for (size_t i = 0; i < 2; i++) {
+     stack[i] = make_stack(stack_size);
+     setup(&(jmp[i]), stack[i].get(), stack_size, fns[i]);
+  }
+
+  for (size_t i = 0; ; i = (i + 1) % n) {
+    jmp[i].enter();
+  }
 
   return 0;
 }
